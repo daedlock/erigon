@@ -13,6 +13,7 @@ import (
 	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
 	"github.com/ledgerwatch/erigon/cmd/verkle/verkletrie"
 	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
 	"github.com/ledgerwatch/log/v3"
 )
@@ -279,6 +280,32 @@ func dump(cfg optionsCfg) error {
 	return nil
 }
 
+func progress(cfg optionsCfg) error {
+	db, err := mdbx.Open(cfg.verkleDb, log.Root(), false)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.BeginRw(cfg.ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	blockNum, err := stages.GetStageProgress(tx, kv.VerkleTrie)
+	if err != nil {
+		panic(err)
+	}
+
+	hash, err := rawdb.ReadVerkleRoot(tx, blockNum)
+	if err != nil {
+		panic(err)
+	}
+	log.Info("Progress", "hash", hash, "num", blockNum)
+	return nil
+}
+
 func main() {
 	ctx := context.Background()
 	mainDb := flag.String("state-chaindata", "chaindata", "path to the chaindata database file")
@@ -316,6 +343,8 @@ func main() {
 		if err := IncrementVerkleTree(opt); err != nil {
 			log.Error("Error", "err", err.Error())
 		}
+	case "progress":
+		progress(opt)
 	case "dump":
 		log.Info("Dumping in dump.txt")
 		if err := dump(opt); err != nil {
