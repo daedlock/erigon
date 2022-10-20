@@ -180,6 +180,9 @@ func GenerateVerkleTree(cfg optionsCfg) error {
 	if progress, err = stages.GetStageProgress(tx, stages.Execution); err != nil {
 		return err
 	}
+	if err := rawdb.WriteVerkleRoot(vTx, progress, root); err != nil {
+		return err
+	}
 	if err := stages.SaveStageProgress(vTx, stages.VerkleTrie, progress); err != nil {
 		return err
 	}
