@@ -105,6 +105,9 @@ func New(stateReader StateReader) *IntraBlockState {
 	}
 }
 
+func (sdb *IntraBlockState) GetStateObjects() *map[common.Address]*stateObject {
+	return &sdb.stateObjects
+}
 func (sdb *IntraBlockState) SetTracer(tracer StateTracer) {
 	sdb.tracer = tracer
 }

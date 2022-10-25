@@ -64,11 +64,11 @@ func (s Storage) Copy() Storage {
 // First you need to obtain a state object.
 // Account values can be accessed and modified through the object.
 type stateObject struct {
-	address  common.Address
-	data     accounts.Account
-	original accounts.Account
-	db       *IntraBlockState
-
+	address       common.Address
+	data          accounts.Account
+	original      accounts.Account
+	db            *IntraBlockState
+	accessedSlots map[common.Address]map[common.Hash]uint
 	// Write caches.
 	//trie Trie // storage trie, which becomes non-nil on first access
 	code Code // contract bytecode, which gets set when code is loaded
@@ -103,6 +103,7 @@ func newObject(db *IntraBlockState, address common.Address, data, original *acco
 		originStorage:      make(Storage),
 		blockOriginStorage: make(Storage),
 		dirtyStorage:       make(Storage),
+		accessedSlots:      make(map[common.Address]map[common.Hash]uint),
 	}
 	so.data.Copy(data)
 	if !so.data.Initialised {
@@ -118,6 +119,18 @@ func newObject(db *IntraBlockState, address common.Address, data, original *acco
 	so.original.Copy(original)
 
 	return &so
+}
+
+func (so *stateObject) GetAccessedSlots() map[common.Address][]common.Hash {
+
+	out := make(map[common.Address][]common.Hash)
+	for addr := range so.accessedSlots {
+		out[addr] = make([]common.Hash, 0)
+		for key, _ := range so.accessedSlots[addr] {
+			out[addr] = append(out[addr], key)
+		}
+	}
+	return out
 }
 
 // EncodeRLP implements rlp.Encoder.
@@ -160,7 +173,12 @@ func (so *stateObject) GetState(key *common.Hash, out *uint256.Int) {
 		return
 	}
 	// Otherwise return the entry's original value
+	if so.accessedSlots[so.address] == nil {
+		so.accessedSlots[so.address] = make(map[common.Hash]uint)
+	}
+	so.accessedSlots[so.address][*key] = 1
 	so.GetCommittedState(key, out)
+
 }
 
 // GetCommittedState retrieves a value from the committed account storage trie.

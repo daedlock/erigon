@@ -21,11 +21,13 @@ import (
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/core/vm"
+	"github.com/ledgerwatch/erigon/eth/tracers"
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/erigon/turbo/shards"
 	"github.com/ledgerwatch/erigon/turbo/transactions"
 	"github.com/ledgerwatch/log/v3"
+	"github.com/samber/lo"
 )
 
 const (
@@ -63,6 +65,7 @@ type TraceCallResult struct {
 	Trace           []*ParityTrace                       `json:"trace"`
 	VmTrace         *VmTrace                             `json:"vmTrace"`
 	TransactionHash *common.Hash                         `json:"transactionHash,omitempty"`
+	AccessedStorage map[common.Address][]common.Hash     `json:"accessedStorage"`
 }
 
 // StateDiffAccount is the part of `trace_call` response that is under "stateDiff" tag
@@ -71,6 +74,7 @@ type StateDiffAccount struct {
 	Code    interface{}                            `json:"code"`
 	Nonce   interface{}                            `json:"nonce"`
 	Storage map[common.Hash]map[string]interface{} `json:"storage"`
+	Reads   []common.Hash                          `json:"reads"`
 }
 
 type StateDiffBalance struct {
@@ -593,6 +597,18 @@ func (sd *StateDiff) WriteAccountStorage(address common.Address, incarnation uin
 	m := make(map[string]interface{})
 	m["*"] = &StateDiffStorage{From: common.BytesToHash(original.Bytes()), To: common.BytesToHash(value.Bytes())}
 	accountDiff.Storage[*key] = m
+	return nil
+}
+
+func (sd *StateDiff) ReadAccountStorage(address common.Address, incarnation uint64, key *common.Hash) error {
+	log.Debug("Called trace_adhoc.ReadAccountStoage")
+	accountDiff := sd.sdMap[address]
+	if accountDiff == nil {
+		accountDiff = &StateDiffAccount{Storage: make(map[common.Hash]map[string]interface{})}
+		sd.sdMap[address] = accountDiff
+	}
+
+	// accountDiff.Reads = append(accountDiff.Reads, common.HexToAddress("0xf97e180c050e5ab072211ad2c213eb5aee4df134"))
 	return nil
 }
 
@@ -1160,6 +1176,18 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
 			vmConfig.Tracer = &ot
 		}
 
+		trc := `{
+			retVal: [],
+			step: function(log,db) {this.retVal.push(log.getPC() + ":X:X:X:" + log.op.toString())},
+			fault: function(log,db) {this.retVal.push("FAULT: " + JSON.stringify(log))},
+			result: function(ctx,db) {return this.retVal}
+			}`
+		tracer, err := tracers.New(trc, &tracers.Context{})
+		if err != nil {
+			panic(err)
+		}
+		vmConfig.Tracer = tracer
+
 		// Get a new instance of the EVM.
 		blockCtx, txCtx := transactions.GetEvmContext(msg, header, parentNrOrHash.RequireCanonical, dbtx, api._blockReader)
 		if useParent {
@@ -1212,13 +1240,19 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
 		if !traceTypeTrace {
 			traceResult.Trace = []*ParityTrace{}
 		}
+		stateObjs := ibs.GetStateObjects()
+		for _, accessObject := range *stateObjs {
+			traceResult.AccessedStorage = lo.Assign(traceResult.AccessedStorage, accessObject.GetAccessedSlots())
+		}
 		results = append(results, traceResult)
 		// When txIndexNeeded is not -1, we are tracing specific transaction in the block and not the entire block, so we stop after we've traced
 		// the required transaction
 		if txIndexNeeded != -1 && txIndex == txIndexNeeded {
 			break
 		}
+
 	}
+
 	return results, nil
 }
 
