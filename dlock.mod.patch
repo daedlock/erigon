@@ -1,0 +1,167 @@
+diff --git a/cmd/rpcdaemon/commands/trace_adhoc.go b/cmd/rpcdaemon/commands/trace_adhoc.go
+index ce1371125..9c96d1b05 100644
+--- a/cmd/rpcdaemon/commands/trace_adhoc.go
++++ b/cmd/rpcdaemon/commands/trace_adhoc.go
+@@ -21,11 +21,13 @@ import (
+ 	"github.com/ledgerwatch/erigon/core/types"
+ 	"github.com/ledgerwatch/erigon/core/types/accounts"
+ 	"github.com/ledgerwatch/erigon/core/vm"
++	"github.com/ledgerwatch/erigon/eth/tracers"
+ 	"github.com/ledgerwatch/erigon/rpc"
+ 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
+ 	"github.com/ledgerwatch/erigon/turbo/shards"
+ 	"github.com/ledgerwatch/erigon/turbo/transactions"
+ 	"github.com/ledgerwatch/log/v3"
++	"github.com/samber/lo"
+ )
+ 
+ const (
+@@ -63,6 +65,7 @@ type TraceCallResult struct {
+ 	Trace           []*ParityTrace                       `json:"trace"`
+ 	VmTrace         *VmTrace                             `json:"vmTrace"`
+ 	TransactionHash *common.Hash                         `json:"transactionHash,omitempty"`
++	AccessedStorage map[common.Address][]common.Hash     `json:"accessedStorage"`
+ }
+ 
+ // StateDiffAccount is the part of `trace_call` response that is under "stateDiff" tag
+@@ -71,6 +74,7 @@ type StateDiffAccount struct {
+ 	Code    interface{}                            `json:"code"`
+ 	Nonce   interface{}                            `json:"nonce"`
+ 	Storage map[common.Hash]map[string]interface{} `json:"storage"`
++	Reads   []common.Hash                          `json:"reads"`
+ }
+ 
+ type StateDiffBalance struct {
+@@ -596,6 +600,18 @@ func (sd *StateDiff) WriteAccountStorage(address common.Address, incarnation uin
+ 	return nil
+ }
+ 
++func (sd *StateDiff) ReadAccountStorage(address common.Address, incarnation uint64, key *common.Hash) error {
++	log.Debug("Called trace_adhoc.ReadAccountStoage")
++	accountDiff := sd.sdMap[address]
++	if accountDiff == nil {
++		accountDiff = &StateDiffAccount{Storage: make(map[common.Hash]map[string]interface{})}
++		sd.sdMap[address] = accountDiff
++	}
++
++	// accountDiff.Reads = append(accountDiff.Reads, common.HexToAddress("0xf97e180c050e5ab072211ad2c213eb5aee4df134"))
++	return nil
++}
++
+ func (sd *StateDiff) CreateContract(address common.Address) error {
+ 	if _, ok := sd.sdMap[address]; !ok {
+ 		sd.sdMap[address] = &StateDiffAccount{Storage: make(map[common.Hash]map[string]interface{})}
+@@ -1160,6 +1176,18 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
+ 			vmConfig.Tracer = &ot
+ 		}
+ 
++		trc := `{
++			retVal: [],
++			step: function(log,db) {this.retVal.push(log.getPC() + ":X:X:X:" + log.op.toString())},
++			fault: function(log,db) {this.retVal.push("FAULT: " + JSON.stringify(log))},
++			result: function(ctx,db) {return this.retVal}
++			}`
++		tracer, err := tracers.New(trc, &tracers.Context{})
++		if err != nil {
++			panic(err)
++		}
++		vmConfig.Tracer = tracer
++
+ 		// Get a new instance of the EVM.
+ 		blockCtx, txCtx := transactions.GetEvmContext(msg, header, parentNrOrHash.RequireCanonical, dbtx, api._blockReader)
+ 		if useParent {
+@@ -1212,13 +1240,19 @@ func (api *TraceAPIImpl) doCallMany(ctx context.Context, dbtx kv.Tx, msgs []type
+ 		if !traceTypeTrace {
+ 			traceResult.Trace = []*ParityTrace{}
+ 		}
++		stateObjs := ibs.GetStateObjects()
++		for _, accessObject := range *stateObjs {
++			traceResult.AccessedStorage = lo.Assign(traceResult.AccessedStorage, accessObject.GetAccessedSlots())
++		}
+ 		results = append(results, traceResult)
+ 		// When txIndexNeeded is not -1, we are tracing specific transaction in the block and not the entire block, so we stop after we've traced
+ 		// the required transaction
+ 		if txIndexNeeded != -1 && txIndex == txIndexNeeded {
+ 			break
+ 		}
++
+ 	}
++
+ 	return results, nil
+ }
+ 
+diff --git a/core/state/intra_block_state.go b/core/state/intra_block_state.go
+index a5091e22d..8e46f2810 100644
+--- a/core/state/intra_block_state.go
++++ b/core/state/intra_block_state.go
+@@ -105,6 +105,9 @@ func New(stateReader StateReader) *IntraBlockState {
+ 	}
+ }
+ 
++func (sdb *IntraBlockState) GetStateObjects() *map[common.Address]*stateObject {
++	return &sdb.stateObjects
++}
+ func (sdb *IntraBlockState) SetTracer(tracer StateTracer) {
+ 	sdb.tracer = tracer
+ }
+diff --git a/core/state/state_object.go b/core/state/state_object.go
+index ffdcde3e7..bee2cfefb 100644
+--- a/core/state/state_object.go
++++ b/core/state/state_object.go
+@@ -64,11 +64,11 @@ func (s Storage) Copy() Storage {
+ // First you need to obtain a state object.
+ // Account values can be accessed and modified through the object.
+ type stateObject struct {
+-	address  common.Address
+-	data     accounts.Account
+-	original accounts.Account
+-	db       *IntraBlockState
+-
++	address       common.Address
++	data          accounts.Account
++	original      accounts.Account
++	db            *IntraBlockState
++	accessedSlots map[common.Address]map[common.Hash]uint
+ 	// Write caches.
+ 	//trie Trie // storage trie, which becomes non-nil on first access
+ 	code Code // contract bytecode, which gets set when code is loaded
+@@ -103,6 +103,7 @@ func newObject(db *IntraBlockState, address common.Address, data, original *acco
+ 		originStorage:      make(Storage),
+ 		blockOriginStorage: make(Storage),
+ 		dirtyStorage:       make(Storage),
++		accessedSlots:      make(map[common.Address]map[common.Hash]uint),
+ 	}
+ 	so.data.Copy(data)
+ 	if !so.data.Initialised {
+@@ -120,6 +121,18 @@ func newObject(db *IntraBlockState, address common.Address, data, original *acco
+ 	return &so
+ }
+ 
++func (so *stateObject) GetAccessedSlots() map[common.Address][]common.Hash {
++
++	out := make(map[common.Address][]common.Hash)
++	for addr := range so.accessedSlots {
++		out[addr] = make([]common.Hash, 0)
++		for key, _ := range so.accessedSlots[addr] {
++			out[addr] = append(out[addr], key)
++		}
++	}
++	return out
++}
++
+ // EncodeRLP implements rlp.Encoder.
+ func (so *stateObject) EncodeRLP(w io.Writer) error {
+ 	return rlp.Encode(w, so.data)
+@@ -160,7 +173,12 @@ func (so *stateObject) GetState(key *common.Hash, out *uint256.Int) {
+ 		return
+ 	}
+ 	// Otherwise return the entry's original value
++	if so.accessedSlots[so.address] == nil {
++		so.accessedSlots[so.address] = make(map[common.Hash]uint)
++	}
++	so.accessedSlots[so.address][*key] = 1
+ 	so.GetCommittedState(key, out)
++
+ }
+ 
+ // GetCommittedState retrieves a value from the committed account storage trie.
